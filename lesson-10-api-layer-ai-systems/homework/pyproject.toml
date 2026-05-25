@@ -1,0 +1,16 @@
+[project]
+name = "lesson-10-api-layer-ai-systems"
+version = "0.1.0"
+description = "API Layer for AI Systems - Homework"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi[standard]>=0.115.0",
+]
+
+#[build-system]
+#requires = ["hatchling"]
+#build-backend = "hatchling.build"
+#
+#[project.scripts]
+#hello = "uv_docker_example:hello"
