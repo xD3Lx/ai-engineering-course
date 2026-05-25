@@ -5,7 +5,7 @@ services:
 
     # Host the FastAPI application on port 8000
     ports:
-      - "8000:8000"
+      - "8080:8080"
 
     environment:
       # Include development dependencies when working locally
@@ -15,9 +15,17 @@ services:
     # Alternatively, you could set `UV_PROJECT_ENVIRONMENT` to a path owned by the non-root user
     user: root
 
+    volumes:
+      - ./app:/app/app
+
+    # Override the production CMD so uvicorn picks up file changes
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--reload", "--reload-dir", "/app/app"]
+
     develop:
       # Create a `watch` configuration to update the app
       # https://docs.docker.com/compose/file-watch/#compose-watch-versus-bind-mounts
+      # NOTE: this block only takes effect when you run `docker compose watch`
+      # (or `docker compose up --watch`). Plain `docker compose up` ignores it.
       watch:
         # Sync the working directory with the `/app` directory in the container
         - action: sync
