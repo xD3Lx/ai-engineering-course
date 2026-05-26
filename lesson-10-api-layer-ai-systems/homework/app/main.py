@@ -48,9 +48,9 @@ TIERS = {
 }
 
 API_KEYS = {
-    "demo-free-key", "demo-free",
-    "demo-pro-key", "demo-pro",
-    "demo-enterprise-key", "demo-enterprise",
+    "demo-free-key": "demo-free",
+    "demo-pro-key": "demo-pro",
+    "demo-enterprise-key": "demo-enterprise",
 }
 
 
@@ -187,17 +187,27 @@ async def chat_stream(
         completed = False
         try:
             usage = None
+            # Word-boundary buffer: upstream subword tokens (e.g. " twe",
+            # "lve-facto") get coalesced so each SSE event ends on whitespace.
+            buf = ""
             async for chunk in resp:
                 if chunk.usage:
                     usage = chunk.usage
                 if not chunk.choices:
                     continue
-                token = chunk.choices[0].delta.content
-                if not token:
+                piece = chunk.choices[0].delta.content
+                if not piece:
                     continue
                 if await request.is_disconnected():
                     return  # finally-block bumps aborted_streams + closes resp
-                yield sse({"type": "token", "content": token})
+                buf += piece
+                cut = max(buf.rfind(" "), buf.rfind("\n"))
+                if cut >= 0:
+                    yield sse({"type": "token", "content": buf[: cut + 1]})
+                    buf = buf[cut + 1 :]
+            # Flush any trailing partial word once the upstream stream ends.
+            if buf:
+                yield sse({"type": "token", "content": buf})
 
             inp = (usage.prompt_tokens if usage else 0) or 0
             out = (usage.completion_tokens if usage else 0) or 0
