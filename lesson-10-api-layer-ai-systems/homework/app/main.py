@@ -7,8 +7,9 @@ from collections import Counter
 from contextlib import asynccontextmanager
 
 import psycopg
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Security, status
 from fastapi.responses import StreamingResponse
+from fastapi.security import APIKeyHeader
 from openai import AsyncOpenAI
 from pgvector.psycopg import register_vector_async
 from pydantic import BaseModel
@@ -46,7 +47,11 @@ TIERS = {
     }
 }
 
-ACTIVE_TIER = os.environ.get("TIER", "demo-free")
+API_KEYS = {
+    "demo-free-key", "demo-free",
+    "demo-pro-key", "demo-pro",
+    "demo-enterprise-key", "demo-enterprise",
+}
 
 
 def model_for(tier: str, slot: int) -> tuple[str, float, float] | None:
@@ -56,14 +61,33 @@ def model_for(tier: str, slot: int) -> tuple[str, float, float] | None:
     return models[slot] if slot < len(models) else None
 
 
-PRIMARY = model_for(ACTIVE_TIER, 0)
-SECONDARY = model_for(ACTIVE_TIER, 1)
-TERTIARY = model_for(ACTIVE_TIER, 2)
-# Ordered chain — try primary first, fall through to the next on open-time errors.
-FALLBACK_CHAIN: list[tuple[str, float, float]] = [
-    m for m in (PRIMARY, SECONDARY, TERTIARY) if m is not None
-]
-TOKEN_LIMIT = TIERS[ACTIVE_TIER]["token_limit"]
+def fallback_chain(tier: str) -> list[tuple[str, float, float]]:
+    """Ordered model chain for ``tier`` (primary -> secondary -> tertiary)."""
+    return [m for m in (model_for(tier, i) for i in range(3)) if m is not None]
+
+
+# ---------------------------------------------------------------------------
+# Auth: X-API-Key is mandatory. Missing -> 401, unknown -> 403.
+# auto_error=False so we control the 401 body / WWW-Authenticate header.
+# ---------------------------------------------------------------------------
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_api_key(api_key: str | None = Security(api_key_header)) -> str:
+    """Validate ``X-API-Key`` and return the caller's tier."""
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing X-API-Key header",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+    tier = API_KEYS.get(api_key)
+    if tier is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API key",
+        )
+    return tier
 
 metrics: Counter = Counter()
 embedder: SentenceTransformer | None = None
@@ -105,19 +129,28 @@ def sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-async def open_completion(client: AsyncOpenAI, model_name: str, messages: list[dict]):
+async def open_completion(
+    client: AsyncOpenAI,
+    model_name: str,
+    messages: list[dict],
+    token_limit: int,
+):
     return await client.chat.completions.create(
         model=model_name,
         stream=True,
         stream_options={"include_usage": True},
         # Cap to the tier budget so a runaway response can't blow it.
-        max_tokens=min(1024, TOKEN_LIMIT),
+        max_tokens=min(1024, token_limit),
         messages=messages,
     )
 
 
 @app.post("/chat/stream")
-async def chat_stream(body: ChatIn, request: Request):
+async def chat_stream(
+    body: ChatIn,
+    request: Request,
+    tier: str = Depends(require_api_key),
+):
     rows = await retrieve(body.message)
     sources = [f"chunk_{i}" for i, _ in rows]
     context = "\n\n".join(f"[chunk_{i}] {c}" for i, c in rows)
@@ -126,6 +159,9 @@ async def chat_stream(body: ChatIn, request: Request):
         {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {body.message}"},
     ]
 
+    chain = fallback_chain(tier)
+    token_limit = TIERS[tier]["token_limit"]
+
     # Try each model in order (primary -> secondary -> tertiary). Fallback only
     # happens on failure to *open* the stream; we don't retry mid-stream — that
     # would send the client a second answer after they've already seen tokens.
@@ -133,9 +169,9 @@ async def chat_stream(body: ChatIn, request: Request):
     chosen: tuple[str, float, float] | None = None
     resp = None
     last_error: Exception | None = None
-    for candidate in FALLBACK_CHAIN:
+    for candidate in chain:
         try:
-            resp = await open_completion(llm, candidate[0], messages)
+            resp = await open_completion(llm, candidate[0], messages, token_limit)
             chosen = candidate
             break
         except Exception as exc:  # noqa: BLE001 — bubble up only if all fail
@@ -172,7 +208,7 @@ async def chat_stream(body: ChatIn, request: Request):
             yield sse({
                 "type": "done",
                 "model": model_name,
-                "tier": ACTIVE_TIER,
+                "tier": tier,
                 "usage": {"input_tokens": inp, "output_tokens": out},
                 "cost_usd": round(inp * price_in + out * price_out, 6),
                 "cache_hit": cached > 0,
@@ -194,10 +230,9 @@ async def chat_stream(body: ChatIn, request: Request):
 async def health():
     return {
         "status": "ok",
-        "tier": ACTIVE_TIER,
-        "primary_model": PRIMARY[0] if PRIMARY else None,
-        "secondary_model": SECONDARY[0] if SECONDARY else None,
-        "tertiary_model": TERTIARY[0] if TERTIARY else None,
+        "tiers": {
+            tier: [m[0] for m in fallback_chain(tier)] for tier in TIERS
+        },
         "completed_streams": metrics["completed_streams"],
         "aborted_streams": metrics["aborted_streams"],
     }
