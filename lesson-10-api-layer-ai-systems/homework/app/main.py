@@ -99,50 +99,72 @@ def require_api_key(api_key: str | None = Security(api_key_header)) -> Caller:
 
 
 # ---------------------------------------------------------------------------
-# Rate limit: per-API-key token bucket in Redis.
+# Rate limit: per-API-key token bucket in Redis (reserve-and-settle).
 #
-# Bucket = TIER token_limit, refills fully every WINDOW_SECONDS. We store the
-# *consumed* count in `quota:{api_key}` and rely on key TTL to "refill":
+# A permissive pre-check (GET, then INCR after) loses under concurrency: every
+# parallel request sees `used < limit` at the same instant and passes. So we
+# reserve a worst-case estimate up front *atomically* and settle to real usage
+# after the model finishes:
 #
-#   - First charge:   INCRBY n  +  EXPIRE 60   -> starts the 60s window
-#   - Later charges:  INCRBY n                  -> TTL keeps ticking down
-#   - Window ends:    key expires               -> bucket is full again
+#   1) reserve:  INCRBY est  (+ EXPIRE 60 on first write)
+#                 if new_val > limit -> DECRBY est, return 429 + Retry-After
+#   2) settle:   delta = actual - est
+#                 INCRBY delta   (or DECRBY -delta) once usage arrives
+#   3) abort:    DECRBY est       (full refund if the request didn't complete)
 #
-# Pre-check reads the current count; if it's already >= limit we reject with
-# 429 and use the remaining TTL as Retry-After. This is the standard
-# INCR + EXPIRE pattern that works against Upstash REST (no Lua needed).
+# Only INCRBY / DECRBY / EXPIRE / GET / TTL — works on Upstash REST.
 # ---------------------------------------------------------------------------
-WINDOW_SECONDS = 60
+WINDOW_SECONDS = 180
 
 
 def quota_key(api_key: str) -> str:
     return f"quota:{api_key}"
 
 
-async def quota_retry_after(redis: aioredis.Redis, api_key: str, limit: int) -> int:
-    """Return seconds-to-wait if the bucket is empty, else 0 (request allowed).
+def estimate_tokens(messages: list[dict], token_limit: int) -> int:
+    """Worst-case upfront reservation: ~4 chars/token input + max_tokens output."""
+    prompt_chars = sum(len(m["content"]) for m in messages)
+    input_estimate = max(1, prompt_chars // 4)
+    output_estimate = min(1024, token_limit)
+    return input_estimate + output_estimate
 
-    Permissive pre-check: we don't know the cost upfront, so we let any request
-    through whenever *some* budget remains. The real charge happens after the
-    upstream finishes and we have a usage chunk.
+
+async def quota_reserve(
+    redis: aioredis.Redis, api_key: str, tokens: int, limit: int
+) -> int:
+    """Atomically reserve ``tokens``. Return 0 if reserved, else Retry-After seconds.
+
+    Because INCRBY is atomic, concurrent reservations are serialized on the
+    Redis side: the (N+1)-th caller sees a value that already includes the
+    previous N reservations and gets rejected if it crosses ``limit``.
     """
-    raw = await redis.get(quota_key(api_key))
-    if raw is None or int(raw) < limit:
-        return 0
-    ttl = await redis.ttl(quota_key(api_key))
-    # ttl may be -1 (no expiry) or -2 (missing) due to a race — fall back to
-    # the full window so the client doesn't hammer us in a tight loop.
-    return ttl if ttl > 0 else WINDOW_SECONDS
-
-
-async def quota_consume(redis: aioredis.Redis, api_key: str, tokens: int) -> None:
-    """Charge ``tokens`` against the bucket. Set the TTL on the first write."""
-    if tokens <= 0:
-        return
     new_val = await redis.incrby(quota_key(api_key), tokens)
     if new_val == tokens:
         # First write of a fresh window — start the 60s refill timer.
         await redis.expire(quota_key(api_key), WINDOW_SECONDS)
+    if new_val > limit:
+        # Over budget — give the reservation back so we don't waste it.
+        await redis.decrby(quota_key(api_key), tokens)
+        ttl = await redis.ttl(quota_key(api_key))
+        return ttl if ttl > 0 else WINDOW_SECONDS
+    return 0
+
+
+async def quota_settle(
+    redis: aioredis.Redis, api_key: str, reservation: int, actual: int
+) -> None:
+    """Reconcile a reservation with the real token count once usage arrives."""
+    delta = actual - reservation
+    if delta > 0:
+        await redis.incrby(quota_key(api_key), delta)
+    elif delta < 0:
+        await redis.decrby(quota_key(api_key), -delta)
+
+
+async def quota_refund(redis: aioredis.Redis, api_key: str, tokens: int) -> None:
+    """Hand a reservation back unspent (used when the request aborts)."""
+    if tokens > 0:
+        await redis.decrby(quota_key(api_key), tokens)
 
 metrics: Counter = Counter()
 embedder: SentenceTransformer | None = None
@@ -201,7 +223,11 @@ async def open_completion(
     return await client.chat.completions.create(
         model=model_name,
         stream=True,
+        # Two redundant usage-include flags: ``stream_options`` is the OpenAI
+        # standard, while OpenRouter wants ``usage: {include: true}`` in the
+        # body (free models in particular skip the OpenAI-style flag).
         stream_options={"include_usage": True},
+        extra_body={"usage": {"include": True}},
         # Cap to the tier budget so a runaway response can't blow it.
         max_tokens=min(1024, token_limit),
         messages=messages,
@@ -217,9 +243,22 @@ async def chat_stream(
     redis: aioredis.Redis = request.app.state.redis
     token_limit = TIERS[caller.tier]["token_limit"]
 
-    # Token-bucket pre-check. We don't know the cost upfront, so this only
-    # rejects when the bucket is already empty for this window.
-    retry_after = await quota_retry_after(redis, caller.api_key, token_limit)
+    # RAG first so the input-token estimate (and therefore the reservation)
+    # reflects the actual prompt we're about to send.
+    rows = await retrieve(body.message)
+    sources = [f"chunk_{i}" for i, _ in rows]
+    context = "\n\n".join(f"[chunk_{i}] {c}" for i, c in rows)
+    messages = [
+        {"role": "system", "content": "Answer using only the provided context. Be concise."},
+        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {body.message}"},
+    ]
+
+    # Reserve worst-case budget atomically. This is what makes parallel bursts
+    # actually get capped — INCRBY serializes the concurrent reservations.
+    reservation = estimate_tokens(messages, token_limit)
+    retry_after = await quota_reserve(
+        redis, caller.api_key, reservation, token_limit
+    )
     if retry_after:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -229,14 +268,6 @@ async def chat_stream(
             ),
             headers={"Retry-After": str(retry_after)},
         )
-
-    rows = await retrieve(body.message)
-    sources = [f"chunk_{i}" for i, _ in rows]
-    context = "\n\n".join(f"[chunk_{i}] {c}" for i, c in rows)
-    messages = [
-        {"role": "system", "content": "Answer using only the provided context. Be concise."},
-        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {body.message}"},
-    ]
 
     chain = fallback_chain(caller.tier)
 
@@ -255,6 +286,9 @@ async def chat_stream(
         except Exception as exc:  # noqa: BLE001 — bubble up only if all fail
             last_error = exc
     if chosen is None or resp is None:
+        # All models failed to open — refund the reservation we just made so
+        # the caller isn't billed for a stream that never started.
+        await quota_refund(redis, caller.api_key, reservation)
         raise last_error if last_error else RuntimeError("No models configured")
 
     model_name, price_in_mtok, price_out_mtok = chosen
@@ -268,6 +302,7 @@ async def chat_stream(
             # Word-boundary buffer: upstream subword tokens (e.g. " twe",
             # "lve-facto") get coalesced so each SSE event ends on whitespace.
             buf = ""
+            output_chars = 0  # Tracked for the no-usage fallback estimate.
             async for chunk in resp:
                 if chunk.usage:
                     usage = chunk.usage
@@ -278,6 +313,7 @@ async def chat_stream(
                     continue
                 if await request.is_disconnected():
                     return  # finally-block bumps aborted_streams + closes resp
+                output_chars += len(piece)
                 buf += piece
                 cut = max(buf.rfind(" "), buf.rfind("\n"))
                 if cut >= 0:
@@ -287,20 +323,31 @@ async def chat_stream(
             if buf:
                 yield sse({"type": "token", "content": buf})
 
-            inp = (usage.prompt_tokens if usage else 0) or 0
-            out = (usage.completion_tokens if usage else 0) or 0
+            # Prefer real usage; otherwise estimate from character counts so the
+            # bucket is always charged something (free OpenRouter models often
+            # omit the usage chunk entirely). ~4 chars per token is a coarse but
+            # widely-used heuristic.
+            if usage:
+                inp = usage.prompt_tokens or 0
+                out = usage.completion_tokens or 0
+                estimated = False
+            else:
+                prompt_chars = sum(len(m["content"]) for m in messages)
+                inp = max(1, prompt_chars // 4)
+                out = max(1, output_chars // 4)
+                estimated = True
             cached = 0
-            details = getattr(usage, "prompt_tokens_details", None)
+            details = getattr(usage, "prompt_tokens_details", None) if usage else None
             if details is not None:
                 cached = getattr(details, "cached_tokens", 0) or 0
-            # Charge the bucket with actual usage. Early disconnects skip this
-            # because the `return` above exits before we reach here.
-            await quota_consume(redis, caller.api_key, inp + out)
+            # Reconcile the reservation with what we actually used. This
+            # converts the worst-case hold into the real charge.
+            await quota_settle(redis, caller.api_key, reservation, inp + out)
             yield sse({
                 "type": "done",
                 "model": model_name,
                 "tier": caller.tier,
-                "usage": {"input_tokens": inp, "output_tokens": out},
+                "usage": {"input_tokens": inp, "output_tokens": out, "estimated": estimated},
                 "cost_usd": round(inp * price_in + out * price_out, 6),
                 "cache_hit": cached > 0,
                 "sources": sources,
@@ -308,6 +355,10 @@ async def chat_stream(
             completed = True
         finally:
             await resp.close()  # cancels the upstream HTTP request → stops billing
+            if not completed:
+                # Stream aborted (client disconnect, exception, etc.) — refund
+                # the full reservation since we never got a real usage figure.
+                await quota_refund(redis, caller.api_key, reservation)
             metrics["completed_streams" if completed else "aborted_streams"] += 1
 
     return StreamingResponse(
