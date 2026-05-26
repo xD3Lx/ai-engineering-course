@@ -13,6 +13,8 @@ dependencies = [
     "langchain-text-splitters>=0.3.0",
     # Chat streaming (app/main.py) — OpenRouter exposes an OpenAI-compatible API
     "openai>=1.50.0",
+    # Per-API-key token bucket — works against Upstash Redis over RESP.
+    "redis>=5.0.0",
 ]
 
 #[build-system]

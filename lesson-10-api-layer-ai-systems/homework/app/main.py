@@ -5,8 +5,10 @@ import json
 import os
 from collections import Counter
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 import psycopg
+import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI, HTTPException, Request, Security, status
 from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
@@ -73,8 +75,14 @@ def fallback_chain(tier: str) -> list[tuple[str, float, float]]:
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-def require_api_key(api_key: str | None = Security(api_key_header)) -> str:
-    """Validate ``X-API-Key`` and return the caller's tier."""
+@dataclass(frozen=True)
+class Caller:
+    api_key: str
+    tier: str
+
+
+def require_api_key(api_key: str | None = Security(api_key_header)) -> Caller:
+    """Validate ``X-API-Key`` and return the caller (key + tier)."""
     if not api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -87,7 +95,54 @@ def require_api_key(api_key: str | None = Security(api_key_header)) -> str:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API key",
         )
-    return tier
+    return Caller(api_key=api_key, tier=tier)
+
+
+# ---------------------------------------------------------------------------
+# Rate limit: per-API-key token bucket in Redis.
+#
+# Bucket = TIER token_limit, refills fully every WINDOW_SECONDS. We store the
+# *consumed* count in `quota:{api_key}` and rely on key TTL to "refill":
+#
+#   - First charge:   INCRBY n  +  EXPIRE 60   -> starts the 60s window
+#   - Later charges:  INCRBY n                  -> TTL keeps ticking down
+#   - Window ends:    key expires               -> bucket is full again
+#
+# Pre-check reads the current count; if it's already >= limit we reject with
+# 429 and use the remaining TTL as Retry-After. This is the standard
+# INCR + EXPIRE pattern that works against Upstash REST (no Lua needed).
+# ---------------------------------------------------------------------------
+WINDOW_SECONDS = 60
+
+
+def quota_key(api_key: str) -> str:
+    return f"quota:{api_key}"
+
+
+async def quota_retry_after(redis: aioredis.Redis, api_key: str, limit: int) -> int:
+    """Return seconds-to-wait if the bucket is empty, else 0 (request allowed).
+
+    Permissive pre-check: we don't know the cost upfront, so we let any request
+    through whenever *some* budget remains. The real charge happens after the
+    upstream finishes and we have a usage chunk.
+    """
+    raw = await redis.get(quota_key(api_key))
+    if raw is None or int(raw) < limit:
+        return 0
+    ttl = await redis.ttl(quota_key(api_key))
+    # ttl may be -1 (no expiry) or -2 (missing) due to a race — fall back to
+    # the full window so the client doesn't hammer us in a tight loop.
+    return ttl if ttl > 0 else WINDOW_SECONDS
+
+
+async def quota_consume(redis: aioredis.Redis, api_key: str, tokens: int) -> None:
+    """Charge ``tokens`` against the bucket. Set the TTL on the first write."""
+    if tokens <= 0:
+        return
+    new_val = await redis.incrby(quota_key(api_key), tokens)
+    if new_val == tokens:
+        # First write of a fresh window — start the 60s refill timer.
+        await redis.expire(quota_key(api_key), WINDOW_SECONDS)
 
 metrics: Counter = Counter()
 embedder: SentenceTransformer | None = None
@@ -101,7 +156,15 @@ async def lifespan(app: FastAPI):
         base_url="https://openrouter.ai/api/v1",
         api_key=os.environ["OPENROUTER_API_KEY"],
     )
-    yield
+    # Upstash exposes a regular RESP endpoint at rediss://... that works
+    # transparently with redis-py — REST is only needed in serverless runtimes.
+    app.state.redis = aioredis.from_url(
+        os.environ["REDIS_URL"], decode_responses=True
+    )
+    try:
+        yield
+    finally:
+        await app.state.redis.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -149,8 +212,24 @@ async def open_completion(
 async def chat_stream(
     body: ChatIn,
     request: Request,
-    tier: str = Depends(require_api_key),
+    caller: Caller = Depends(require_api_key),
 ):
+    redis: aioredis.Redis = request.app.state.redis
+    token_limit = TIERS[caller.tier]["token_limit"]
+
+    # Token-bucket pre-check. We don't know the cost upfront, so this only
+    # rejects when the bucket is already empty for this window.
+    retry_after = await quota_retry_after(redis, caller.api_key, token_limit)
+    if retry_after:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"Rate limit exceeded for tier '{caller.tier}' "
+                f"({token_limit} tokens / {WINDOW_SECONDS}s)"
+            ),
+            headers={"Retry-After": str(retry_after)},
+        )
+
     rows = await retrieve(body.message)
     sources = [f"chunk_{i}" for i, _ in rows]
     context = "\n\n".join(f"[chunk_{i}] {c}" for i, c in rows)
@@ -159,8 +238,7 @@ async def chat_stream(
         {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {body.message}"},
     ]
 
-    chain = fallback_chain(tier)
-    token_limit = TIERS[tier]["token_limit"]
+    chain = fallback_chain(caller.tier)
 
     # Try each model in order (primary -> secondary -> tertiary). Fallback only
     # happens on failure to *open* the stream; we don't retry mid-stream — that
@@ -215,10 +293,13 @@ async def chat_stream(
             details = getattr(usage, "prompt_tokens_details", None)
             if details is not None:
                 cached = getattr(details, "cached_tokens", 0) or 0
+            # Charge the bucket with actual usage. Early disconnects skip this
+            # because the `return` above exits before we reach here.
+            await quota_consume(redis, caller.api_key, inp + out)
             yield sse({
                 "type": "done",
                 "model": model_name,
-                "tier": tier,
+                "tier": caller.tier,
                 "usage": {"input_tokens": inp, "output_tokens": out},
                 "cost_usd": round(inp * price_in + out * price_out, 6),
                 "cache_hit": cached > 0,
