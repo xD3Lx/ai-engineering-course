@@ -197,9 +197,11 @@ def embed(question: str) -> list[float]:
 async def cache_lookup(qdrant: AsyncQdrantClient, vec: list[float]) -> dict | None:
     """Return the most similar non-expired cached payload, or None on miss."""
     now = int(time.time())
-    hits = await qdrant.search(
+    # ``query_points`` replaced the (removed) ``search`` method in qdrant-client
+    # 1.10+. The response is a QueryResponse with .points instead of a bare list.
+    result = await qdrant.query_points(
         collection_name=CACHE_COLLECTION,
-        query_vector=vec,
+        query=vec,
         limit=1,
         score_threshold=CACHE_THRESHOLD,
         query_filter=qmodels.Filter(
@@ -209,10 +211,11 @@ async def cache_lookup(qdrant: AsyncQdrantClient, vec: list[float]) -> dict | No
             )],
         ),
     )
-    if not hits:
+    if not result.points:
         return None
-    payload = dict(hits[0].payload or {})
-    payload["score"] = hits[0].score
+    hit = result.points[0]
+    payload = dict(hit.payload or {})
+    payload["score"] = hit.score
     return payload
 
 
