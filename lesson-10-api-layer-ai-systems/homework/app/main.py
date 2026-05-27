@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import uuid
 from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -15,6 +17,7 @@ from fastapi.security import APIKeyHeader
 from openai import AsyncOpenAI
 from pgvector.psycopg import register_vector_async
 from pydantic import BaseModel
+from qdrant_client import AsyncQdrantClient, models as qmodels
 from sentence_transformers import SentenceTransformer
 
 # ---------------------------------------------------------------------------
@@ -166,6 +169,80 @@ async def quota_refund(redis: aioredis.Redis, api_key: str, tokens: int) -> None
     if tokens > 0:
         await redis.decrby(quota_key(api_key), tokens)
 
+
+# ---------------------------------------------------------------------------
+# Semantic cache: Qdrant collection of (question embedding -> response).
+#
+# Global cache (one collection for all API keys) — this is a public Q&A bot,
+# not private data. RAG and cache share the same embedding model so vectors
+# are directly comparable.
+#
+# Qdrant has no built-in TTL, so we stamp `expire_at` (unix seconds) into the
+# payload and filter on it at query time. Stale points still sit in the
+# collection until something overwrites them; a periodic cleanup job is fine
+# but not required for correctness.
+# ---------------------------------------------------------------------------
+CACHE_COLLECTION = "cache_collection"
+EMBED_DIM = 384  # all-MiniLM-L6-v2
+CACHE_THRESHOLD = 0.92  # cosine similarity required to serve from cache
+CACHE_TTL_SECONDS = 3600  # 1 hour
+
+
+def embed(question: str) -> list[float]:
+    """Encode once per request — reused for cache lookup and RAG retrieval."""
+    assert embedder is not None
+    return embedder.encode([question], normalize_embeddings=True)[0].tolist()
+
+
+async def cache_lookup(qdrant: AsyncQdrantClient, vec: list[float]) -> dict | None:
+    """Return the most similar non-expired cached payload, or None on miss."""
+    now = int(time.time())
+    hits = await qdrant.search(
+        collection_name=CACHE_COLLECTION,
+        query_vector=vec,
+        limit=1,
+        score_threshold=CACHE_THRESHOLD,
+        query_filter=qmodels.Filter(
+            must=[qmodels.FieldCondition(
+                key="expire_at",
+                range=qmodels.Range(gte=now),
+            )],
+        ),
+    )
+    if not hits:
+        return None
+    payload = dict(hits[0].payload or {})
+    payload["score"] = hits[0].score
+    return payload
+
+
+async def cache_store(
+    qdrant: AsyncQdrantClient,
+    vec: list[float],
+    query: str,
+    response: str,
+    model: str,
+    sources: list[str],
+) -> None:
+    """Upsert a (query, response) pair into the semantic cache."""
+    now = int(time.time())
+    await qdrant.upsert(
+        collection_name=CACHE_COLLECTION,
+        points=[qmodels.PointStruct(
+            id=str(uuid.uuid4()),
+            vector=vec,
+            payload={
+                "query": query,
+                "response": response,
+                "model": model,
+                "sources": sources,
+                "timestamp": now,
+                "expire_at": now + CACHE_TTL_SECONDS,
+            },
+        )],
+    )
+
+
 metrics: Counter = Counter()
 embedder: SentenceTransformer | None = None
 
@@ -183,10 +260,31 @@ async def lifespan(app: FastAPI):
     app.state.redis = aioredis.from_url(
         os.environ["REDIS_URL"], decode_responses=True
     )
+    # Qdrant for the semantic response cache. Idempotent ensure-collection
+    # so the app boots whether or not the collection already exists.
+    app.state.qdrant = AsyncQdrantClient(
+        url=os.environ["QDRANT_URL"],
+        api_key=os.environ.get("QDRANT_API_KEY"),
+    )
+    existing = {c.name for c in (await app.state.qdrant.get_collections()).collections}
+    if CACHE_COLLECTION not in existing:
+        await app.state.qdrant.create_collection(
+            collection_name=CACHE_COLLECTION,
+            vectors_config=qmodels.VectorParams(
+                size=EMBED_DIM, distance=qmodels.Distance.COSINE
+            ),
+        )
+        # Indexed payload field — required to filter on expire_at efficiently.
+        await app.state.qdrant.create_payload_index(
+            collection_name=CACHE_COLLECTION,
+            field_name="expire_at",
+            field_schema=qmodels.PayloadSchemaType.INTEGER,
+        )
     try:
         yield
     finally:
         await app.state.redis.aclose()
+        await app.state.qdrant.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -196,9 +294,12 @@ class ChatIn(BaseModel):
     message: str
 
 
-async def retrieve(question: str, k: int = 3) -> list[tuple[int, str]]:
-    """Return [(chunk_index, content), ...] for the top-K nearest chunks."""
-    vec = embedder.encode([question], normalize_embeddings=True)[0].tolist()
+async def retrieve(vec: list[float], k: int = 3) -> list[tuple[int, str]]:
+    """Return [(chunk_index, content), ...] for the top-K nearest chunks.
+
+    Takes a pre-computed vector so the embedding step is only paid once per
+    request — the same vector is used for the semantic cache lookup.
+    """
     async with await psycopg.AsyncConnection.connect(os.environ["DB_URL"]) as conn:
         await register_vector_async(conn)
         async with conn.cursor() as cur:
@@ -234,6 +335,28 @@ async def open_completion(
     )
 
 
+async def replay_cached(payload: dict, tier: str):
+    """Stream a cached response back token-by-token so the UX matches a fresh
+    call (same SSE event shape, same word-aligned chunking)."""
+    response = payload.get("response", "")
+    # Word-by-word replay keeps each event aligned to a whitespace boundary,
+    # matching the live-streaming buffer's behavior.
+    for word in response.split(" "):
+        if word == "":
+            continue
+        yield sse({"type": "token", "content": word + " "})
+    yield sse({
+        "type": "done",
+        "model": payload.get("model"),
+        "tier": tier,
+        "usage": {"input_tokens": 0, "output_tokens": 0, "estimated": False},
+        "cost_usd": 0.0,
+        "cache_hit": True,
+        "cache_score": payload.get("score"),
+        "sources": payload.get("sources", []),
+    })
+
+
 @app.post("/chat/stream")
 async def chat_stream(
     body: ChatIn,
@@ -241,11 +364,26 @@ async def chat_stream(
     caller: Caller = Depends(require_api_key),
 ):
     redis: aioredis.Redis = request.app.state.redis
+    qdrant: AsyncQdrantClient = request.app.state.qdrant
     token_limit = TIERS[caller.tier]["token_limit"]
 
-    # RAG first so the input-token estimate (and therefore the reservation)
-    # reflects the actual prompt we're about to send.
-    rows = await retrieve(body.message)
+    # Single embedding call, reused for cache lookup and RAG retrieval below.
+    vec = embed(body.message)
+
+    # Semantic cache check. A HIT short-circuits the LLM call entirely — no
+    # rate-limit charge, no upstream tokens, just replay the stored response.
+    cached = await cache_lookup(qdrant, vec)
+    if cached is not None:
+        metrics["cache_hits"] += 1
+        return StreamingResponse(
+            replay_cached(cached, caller.tier),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    metrics["cache_misses"] += 1
+
+    # MISS — RAG using the same vector, then build the prompt as usual.
+    rows = await retrieve(vec)
     sources = [f"chunk_{i}" for i, _ in rows]
     context = "\n\n".join(f"[chunk_{i}] {c}" for i, c in rows)
     messages = [
@@ -303,6 +441,7 @@ async def chat_stream(
             # "lve-facto") get coalesced so each SSE event ends on whitespace.
             buf = ""
             output_chars = 0  # Tracked for the no-usage fallback estimate.
+            full_response = ""  # Accumulated text to store in the cache on success.
             async for chunk in resp:
                 if chunk.usage:
                     usage = chunk.usage
@@ -314,6 +453,7 @@ async def chat_stream(
                 if await request.is_disconnected():
                     return  # finally-block bumps aborted_streams + closes resp
                 output_chars += len(piece)
+                full_response += piece
                 buf += piece
                 cut = max(buf.rfind(" "), buf.rfind("\n"))
                 if cut >= 0:
@@ -343,13 +483,21 @@ async def chat_stream(
             # Reconcile the reservation with what we actually used. This
             # converts the worst-case hold into the real charge.
             await quota_settle(redis, caller.api_key, reservation, inp + out)
+            # Store the completed response in the semantic cache so the next
+            # similar question can short-circuit the LLM.
+            if full_response.strip():
+                await cache_store(
+                    qdrant, vec, body.message, full_response,
+                    model_name, sources,
+                )
             yield sse({
                 "type": "done",
                 "model": model_name,
                 "tier": caller.tier,
                 "usage": {"input_tokens": inp, "output_tokens": out, "estimated": estimated},
                 "cost_usd": round(inp * price_in + out * price_out, 6),
-                "cache_hit": cached > 0,
+                "cache_hit": False,
+                "prompt_cache_hit": cached > 0,
                 "sources": sources,
             })
             completed = True
@@ -377,4 +525,6 @@ async def health():
         },
         "completed_streams": metrics["completed_streams"],
         "aborted_streams": metrics["aborted_streams"],
+        "cache_hits": metrics["cache_hits"],
+        "cache_misses": metrics["cache_misses"],
     }

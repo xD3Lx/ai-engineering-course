@@ -15,6 +15,9 @@ dependencies = [
     "openai>=1.50.0",
     # Per-API-key token bucket — works against Upstash Redis over RESP.
     "redis>=5.0.0",
+    # Semantic response cache — Qdrant for the cache vectors (separate from
+    # the pgvector RAG store) because Upstash Redis has no vector search.
+    "qdrant-client>=1.10.0",
 ]
 
 #[build-system]
