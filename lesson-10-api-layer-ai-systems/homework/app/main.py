@@ -20,36 +20,38 @@ from pydantic import BaseModel
 from qdrant_client import AsyncQdrantClient, models as qmodels
 from sentence_transformers import SentenceTransformer
 
+from .pricing import PRICING, cost_usd
+
 # ---------------------------------------------------------------------------
-# Tiers: each entry is a list of (model_name, price_in_per_mtok, price_out_per_mtok).
-# Position 0 is the primary model; position 1 is the secondary (fallback).
-# Prices are USD per 1,000,000 tokens.
+# Tiers: per-tier token budget and ordered model fallback chain. Pricing lives
+# in pricing.py — it's the single source of truth for cost math.
+# Position 0 is the primary model; later positions are fallbacks.
 # ---------------------------------------------------------------------------
-TIERS = {
+TIERS: dict[str, dict] = {
     "demo-free": {
         "token_limit": 5_000,
         "models": [
-            ("google/gemma-4-31b-it:free", 0.0, 0.0),
-            ("meta-llama/llama-3.3-70b-instruct:free", 0.0, 0.0),
-            ("meta-llama/llama-3.2-3b-instruct:free", 0.0, 0.0),
+            "google/gemma-4-31b-it:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "meta-llama/llama-3.2-3b-instruct:free",
         ],
     },
     "demo-pro": {
         "token_limit": 20_000,
         "models": [
-            ("google/gemma-4-31b-it", 0.12, 0.37),
-            ("openai/gpt-5.4-nano", 0.18, 1.25),
-            ("anthropic/claude-3-haiku", 0.25, 1.25),
+            "google/gemma-4-31b-it",
+            "openai/gpt-5.4-nano",
+            "anthropic/claude-3-haiku",
         ],
     },
     "demo-enterprise": {
         "token_limit": 100_000,
         "models": [
-            ("openai/gpt-5.4-mini", 0.75, 4.5),
-            ("google/gemini-3.5-flash", 1.5, 9),
-            ("anthropic/claude-haiku-4.5", 0.8, 4),
-        ]
-    }
+            "openai/gpt-5.4-mini",
+            "google/gemini-3.5-flash",
+            "anthropic/claude-haiku-4.5",
+        ],
+    },
 }
 
 API_KEYS = {
@@ -59,16 +61,15 @@ API_KEYS = {
 }
 
 
-def model_for(tier: str, slot: int) -> tuple[str, float, float] | None:
-    """Return ``(name, price_in_per_mtok, price_out_per_mtok)`` for the tier slot,
-    or None if the tier has no model at that position."""
+def model_for(tier: str, slot: int) -> str | None:
+    """Return the model name for ``tier`` at ``slot``, or None if absent."""
     models = TIERS[tier]["models"]
     return models[slot] if slot < len(models) else None
 
 
-def fallback_chain(tier: str) -> list[tuple[str, float, float]]:
+def fallback_chain(tier: str) -> list[str]:
     """Ordered model chain for ``tier`` (primary -> secondary -> tertiary)."""
-    return [m for m in (model_for(tier, i) for i in range(3)) if m is not None]
+    return list(TIERS[tier]["models"])
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +227,15 @@ async def cache_store(
     response: str,
     model: str,
     sources: list[str],
+    input_tokens: int,
+    output_tokens: int,
+    fallback_used: bool,
 ) -> None:
-    """Upsert a (query, response) pair into the semantic cache."""
+    """Upsert a (query, response) pair into the semantic cache.
+
+    Token counts and fallback flag are stored alongside so that future cache
+    hits can be logged into ``usage_log`` with the original model context.
+    """
     now = int(time.time())
     await qdrant.upsert(
         collection_name=CACHE_COLLECTION,
@@ -241,9 +249,75 @@ async def cache_store(
                 "sources": sources,
                 "timestamp": now,
                 "expire_at": now + CACHE_TTL_SECONDS,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "fallback_used": fallback_used,
             },
         )],
     )
+
+
+# ---------------------------------------------------------------------------
+# Usage log: one row per /chat/stream request in Postgres. Source of truth
+# for the /usage endpoints. Cost comes from pricing.cost_usd so the math
+# stays consistent everywhere.
+# ---------------------------------------------------------------------------
+USAGE_LOG_DDL = """
+CREATE TABLE IF NOT EXISTS usage_log (
+    request_id    UUID         PRIMARY KEY,
+    api_key       TEXT         NOT NULL,
+    model         TEXT         NOT NULL,
+    input_tokens  INT          NOT NULL,
+    output_tokens INT          NOT NULL,
+    cost_usd      NUMERIC(12, 6) NOT NULL,
+    latency_ms    INT          NOT NULL,
+    ttft_ms       INT,
+    cache_hit     BOOLEAN      NOT NULL,
+    fallback_used BOOLEAN      NOT NULL,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS usage_log_api_key_created_at
+    ON usage_log (api_key, created_at DESC);
+"""
+
+
+async def ensure_usage_log() -> None:
+    async with await psycopg.AsyncConnection.connect(os.environ["DB_URL"]) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(USAGE_LOG_DDL)
+        await conn.commit()
+
+
+async def log_usage(
+    *,
+    request_id: str,
+    api_key: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    latency_ms: int,
+    ttft_ms: int | None,
+    cache_hit: bool,
+    fallback_used: bool,
+) -> None:
+    """Insert a single usage row. Cost is computed from pricing.cost_usd."""
+    cost = cost_usd(model, input_tokens, output_tokens)
+    async with await psycopg.AsyncConnection.connect(os.environ["DB_URL"]) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO usage_log (
+                    request_id, api_key, model, input_tokens, output_tokens,
+                    cost_usd, latency_ms, ttft_ms, cache_hit, fallback_used
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    request_id, api_key, model, input_tokens, output_tokens,
+                    cost, latency_ms, ttft_ms, cache_hit, fallback_used,
+                ),
+            )
+        await conn.commit()
 
 
 metrics: Counter = Counter()
@@ -279,6 +353,8 @@ async def lifespan(app: FastAPI):
         field_name="expire_at",
         field_schema=qmodels.PayloadSchemaType.INTEGER,
     )
+    # Make sure the usage_log table + index exist before serving traffic.
+    await ensure_usage_log()
     try:
         yield
     finally:
@@ -334,15 +410,25 @@ async def open_completion(
     )
 
 
-async def replay_cached(payload: dict, tier: str):
+async def replay_cached(
+    payload: dict,
+    tier: str,
+    request_id: str,
+    api_key: str,
+    start_ts: float,
+):
     """Stream a cached response back token-by-token so the UX matches a fresh
-    call (same SSE event shape, same word-aligned chunking)."""
+    call (same SSE event shape, same word-aligned chunking). Logs the request
+    into ``usage_log`` once the stream completes."""
     response = payload.get("response", "")
+    ttft_ms: int | None = None
     # Word-by-word replay keeps each event aligned to a whitespace boundary,
     # matching the live-streaming buffer's behavior.
     for word in response.split(" "):
         if word == "":
             continue
+        if ttft_ms is None:
+            ttft_ms = int((time.time() - start_ts) * 1000)
         yield sse({"type": "token", "content": word + " "})
     yield sse({
         "type": "done",
@@ -353,7 +439,22 @@ async def replay_cached(payload: dict, tier: str):
         "cache_hit": True,
         "cache_score": payload.get("score"),
         "sources": payload.get("sources", []),
+        "request_id": request_id,
     })
+    latency_ms = int((time.time() - start_ts) * 1000)
+    await log_usage(
+        request_id=request_id,
+        api_key=api_key,
+        model=payload.get("model", "unknown"),
+        # Cache hits don't burn upstream tokens — store 0 so daily token totals
+        # reflect actual LLM consumption, not the saved-by-cache amount.
+        input_tokens=0,
+        output_tokens=0,
+        latency_ms=latency_ms,
+        ttft_ms=ttft_ms,
+        cache_hit=True,
+        fallback_used=bool(payload.get("fallback_used", False)),
+    )
 
 
 @app.post("/chat/stream")
@@ -366,6 +467,11 @@ async def chat_stream(
     qdrant: AsyncQdrantClient = request.app.state.qdrant
     token_limit = TIERS[caller.tier]["token_limit"]
 
+    # Per-request observability handles. Carried through the whole flow so
+    # both cache-hit and cache-miss paths log a consistent usage_log row.
+    request_id = str(uuid.uuid4())
+    start_ts = time.time()
+
     # Single embedding call, reused for cache lookup and RAG retrieval below.
     vec = embed(body.message)
 
@@ -375,7 +481,12 @@ async def chat_stream(
     if cached is not None:
         metrics["cache_hits"] += 1
         return StreamingResponse(
-            replay_cached(cached, caller.tier),
+            replay_cached(
+                cached, caller.tier,
+                request_id=request_id,
+                api_key=caller.api_key,
+                start_ts=start_ts,
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -412,28 +523,27 @@ async def chat_stream(
     # happens on failure to *open* the stream; we don't retry mid-stream — that
     # would send the client a second answer after they've already seen tokens.
     llm: AsyncOpenAI = request.app.state.llm
-    chosen: tuple[str, float, float] | None = None
+    model_name: str | None = None
+    fallback_used = False
     resp = None
     last_error: Exception | None = None
-    for candidate in chain:
+    for slot, candidate in enumerate(chain):
         try:
-            resp = await open_completion(llm, candidate[0], messages, token_limit)
-            chosen = candidate
+            resp = await open_completion(llm, candidate, messages, token_limit)
+            model_name = candidate
+            fallback_used = slot > 0  # primary is slot 0
             break
         except Exception as exc:  # noqa: BLE001 — bubble up only if all fail
             last_error = exc
-    if chosen is None or resp is None:
+    if model_name is None or resp is None:
         # All models failed to open — refund the reservation we just made so
         # the caller isn't billed for a stream that never started.
         await quota_refund(redis, caller.api_key, reservation)
         raise last_error if last_error else RuntimeError("No models configured")
 
-    model_name, price_in_mtok, price_out_mtok = chosen
-    price_in = price_in_mtok / 1_000_000
-    price_out = price_out_mtok / 1_000_000
-
     async def gen():
         completed = False
+        ttft_ms: int | None = None
         try:
             usage = None
             # Word-boundary buffer: upstream subword tokens (e.g. " twe",
@@ -451,6 +561,8 @@ async def chat_stream(
                     continue
                 if await request.is_disconnected():
                     return  # finally-block bumps aborted_streams + closes resp
+                if ttft_ms is None:
+                    ttft_ms = int((time.time() - start_ts) * 1000)
                 output_chars += len(piece)
                 full_response += piece
                 buf += piece
@@ -475,31 +587,50 @@ async def chat_stream(
                 inp = max(1, prompt_chars // 4)
                 out = max(1, output_chars // 4)
                 estimated = True
-            cached = 0
+            prompt_cached = 0
             details = getattr(usage, "prompt_tokens_details", None) if usage else None
             if details is not None:
-                cached = getattr(details, "cached_tokens", 0) or 0
+                prompt_cached = getattr(details, "cached_tokens", 0) or 0
             # Reconcile the reservation with what we actually used. This
             # converts the worst-case hold into the real charge.
             await quota_settle(redis, caller.api_key, reservation, inp + out)
             # Store the completed response in the semantic cache so the next
-            # similar question can short-circuit the LLM.
+            # similar question can short-circuit the LLM. Token counts and the
+            # fallback flag travel with the payload so future cache hits log
+            # with the original request's context.
             if full_response.strip():
                 await cache_store(
                     qdrant, vec, body.message, full_response,
                     model_name, sources,
+                    input_tokens=inp,
+                    output_tokens=out,
+                    fallback_used=fallback_used,
                 )
             yield sse({
                 "type": "done",
                 "model": model_name,
                 "tier": caller.tier,
                 "usage": {"input_tokens": inp, "output_tokens": out, "estimated": estimated},
-                "cost_usd": round(inp * price_in + out * price_out, 6),
+                "cost_usd": cost_usd(model_name, inp, out),
                 "cache_hit": False,
-                "prompt_cache_hit": cached > 0,
+                "prompt_cache_hit": prompt_cached > 0,
+                "fallback_used": fallback_used,
                 "sources": sources,
+                "request_id": request_id,
             })
             completed = True
+            latency_ms = int((time.time() - start_ts) * 1000)
+            await log_usage(
+                request_id=request_id,
+                api_key=caller.api_key,
+                model=model_name,
+                input_tokens=inp,
+                output_tokens=out,
+                latency_ms=latency_ms,
+                ttft_ms=ttft_ms,
+                cache_hit=False,
+                fallback_used=fallback_used,
+            )
         finally:
             await resp.close()  # cancels the upstream HTTP request → stops billing
             if not completed:
@@ -519,11 +650,109 @@ async def chat_stream(
 async def health():
     return {
         "status": "ok",
-        "tiers": {
-            tier: [m[0] for m in fallback_chain(tier)] for tier in TIERS
-        },
+        "tiers": {tier: fallback_chain(tier) for tier in TIERS},
         "completed_streams": metrics["completed_streams"],
         "aborted_streams": metrics["aborted_streams"],
         "cache_hits": metrics["cache_hits"],
         "cache_misses": metrics["cache_misses"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Usage endpoints. Scoped to the caller's API key (auth via X-API-Key) and
+# always covering "today" (Postgres CURRENT_DATE in the DB's timezone).
+# ---------------------------------------------------------------------------
+@app.get("/usage/today")
+async def usage_today(caller: Caller = Depends(require_api_key)):
+    """Headline numbers for the caller's traffic today: requests, total tokens,
+    total cost. Cache hits count as requests but contribute 0 tokens / 0 cost."""
+    async with await psycopg.AsyncConnection.connect(os.environ["DB_URL"]) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(input_tokens + output_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0)
+                FROM usage_log
+                WHERE api_key = %s AND created_at >= CURRENT_DATE
+                """,
+                (caller.api_key,),
+            )
+            row = await cur.fetchone()
+    requests, tokens, cost = row if row else (0, 0, 0)
+    return {
+        "requests": int(requests),
+        "tokens": int(tokens),
+        "cost_usd": round(float(cost), 6),
+    }
+
+
+@app.get("/usage/breakdown")
+async def usage_breakdown(caller: Caller = Depends(require_api_key)):
+    """Per-model breakdown plus headline cache / fallback / latency stats for
+    the caller's traffic today. p95 uses Postgres' PERCENTILE_CONT."""
+    async with await psycopg.AsyncConnection.connect(os.environ["DB_URL"]) as conn:
+        async with conn.cursor() as cur:
+            # Per-model rollup.
+            await cur.execute(
+                """
+                SELECT
+                    model,
+                    COUNT(*) AS requests,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(cost_usd), 0) AS cost_usd,
+                    COALESCE(AVG(latency_ms), 0) AS avg_latency_ms,
+                    COALESCE(
+                        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms),
+                        0
+                    ) AS p95_latency_ms
+                FROM usage_log
+                WHERE api_key = %s AND created_at >= CURRENT_DATE
+                GROUP BY model
+                ORDER BY requests DESC
+                """,
+                (caller.api_key,),
+            )
+            by_model_rows = await cur.fetchall()
+            # Headline aggregates (cache / fallback rate, overall latency).
+            await cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS requests,
+                    COALESCE(AVG(CASE WHEN cache_hit     THEN 1.0 ELSE 0.0 END), 0),
+                    COALESCE(AVG(CASE WHEN fallback_used THEN 1.0 ELSE 0.0 END), 0),
+                    COALESCE(AVG(latency_ms), 0),
+                    COALESCE(
+                        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms),
+                        0
+                    )
+                FROM usage_log
+                WHERE api_key = %s AND created_at >= CURRENT_DATE
+                """,
+                (caller.api_key,),
+            )
+            agg = await cur.fetchone()
+
+    by_model = [
+        {
+            "model": m,
+            "requests": int(reqs),
+            "input_tokens": int(inp),
+            "output_tokens": int(out),
+            "cost_usd": round(float(cost), 6),
+            "avg_latency_ms": round(float(avg_lat), 1),
+            "p95_latency_ms": round(float(p95_lat), 1),
+        }
+        for m, reqs, inp, out, cost, avg_lat, p95_lat in by_model_rows
+    ]
+    total_reqs, cache_rate, fb_rate, avg_lat, p95_lat = agg if agg else (0, 0, 0, 0, 0)
+    return {
+        "requests": int(total_reqs),
+        "cache_hit_rate": round(float(cache_rate), 4),
+        "fallback_rate": round(float(fb_rate), 4),
+        "avg_latency_ms": round(float(avg_lat), 1),
+        "p95_latency_ms": round(float(p95_lat), 1),
+        "by_model": by_model,
     }
