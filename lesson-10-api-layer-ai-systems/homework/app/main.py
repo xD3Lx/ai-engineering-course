@@ -5,7 +5,6 @@ import json
 import os
 import time
 import uuid
-from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -320,7 +319,24 @@ async def log_usage(
         await conn.commit()
 
 
-metrics: Counter = Counter()
+# ---------------------------------------------------------------------------
+# Metrics: Redis hash so counters persist across restarts and are shared
+# across instances. Single HINCRBY is atomic, no read-modify-write needed.
+# ---------------------------------------------------------------------------
+METRICS_KEY = "metrics:global"
+
+
+async def metric_incr(redis: aioredis.Redis, name: str, by: int = 1) -> None:
+    await redis.hincrby(METRICS_KEY, name, by)
+
+
+async def metrics_snapshot(redis: aioredis.Redis) -> dict[str, int]:
+    """Return every counter as a name -> int dict. Missing counters are absent
+    (callers should use ``.get(name, 0)`` when reading specific fields)."""
+    raw = await redis.hgetall(METRICS_KEY)
+    return {k: int(v) for k, v in raw.items()}
+
+
 embedder: SentenceTransformer | None = None
 
 
@@ -479,7 +495,7 @@ async def chat_stream(
     # rate-limit charge, no upstream tokens, just replay the stored response.
     cached = await cache_lookup(qdrant, vec)
     if cached is not None:
-        metrics["cache_hits"] += 1
+        await metric_incr(redis, "cache_hits")
         return StreamingResponse(
             replay_cached(
                 cached, caller.tier,
@@ -490,7 +506,7 @@ async def chat_stream(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-    metrics["cache_misses"] += 1
+    await metric_incr(redis, "cache_misses")
 
     # MISS — RAG using the same vector, then build the prompt as usual.
     rows = await retrieve(vec)
@@ -637,7 +653,9 @@ async def chat_stream(
                 # Stream aborted (client disconnect, exception, etc.) — refund
                 # the full reservation since we never got a real usage figure.
                 await quota_refund(redis, caller.api_key, reservation)
-            metrics["completed_streams" if completed else "aborted_streams"] += 1
+            await metric_incr(
+                redis, "completed_streams" if completed else "aborted_streams"
+            )
 
     return StreamingResponse(
         gen(),
@@ -647,14 +665,15 @@ async def chat_stream(
 
 
 @app.get("/health")
-async def health():
+async def health(request: Request):
+    snap = await metrics_snapshot(request.app.state.redis)
     return {
         "status": "ok",
         "tiers": {tier: fallback_chain(tier) for tier in TIERS},
-        "completed_streams": metrics["completed_streams"],
-        "aborted_streams": metrics["aborted_streams"],
-        "cache_hits": metrics["cache_hits"],
-        "cache_misses": metrics["cache_misses"],
+        "completed_streams": snap.get("completed_streams", 0),
+        "aborted_streams": snap.get("aborted_streams", 0),
+        "cache_hits": snap.get("cache_hits", 0),
+        "cache_misses": snap.get("cache_misses", 0),
     }
 
 
