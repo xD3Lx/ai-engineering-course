@@ -260,26 +260,22 @@ async def lifespan(app: FastAPI):
     app.state.redis = aioredis.from_url(
         os.environ["REDIS_URL"], decode_responses=True
     )
-    # Qdrant for the semantic response cache. Idempotent ensure-collection
-    # so the app boots whether or not the collection already exists.
-    app.state.qdrant = AsyncQdrantClient(
-        url=os.environ["QDRANT_URL"],
-        api_key=os.environ.get("QDRANT_API_KEY"),
+    # Qdrant for the semantic response cache. ``:memory:`` runs the whole
+    # vector store inside this process — no server, no env vars, but the
+    # cache is wiped on every restart and not shared across instances.
+    app.state.qdrant = AsyncQdrantClient(location=":memory:")
+    await app.state.qdrant.create_collection(
+        collection_name=CACHE_COLLECTION,
+        vectors_config=qmodels.VectorParams(
+            size=EMBED_DIM, distance=qmodels.Distance.COSINE
+        ),
     )
-    existing = {c.name for c in (await app.state.qdrant.get_collections()).collections}
-    if CACHE_COLLECTION not in existing:
-        await app.state.qdrant.create_collection(
-            collection_name=CACHE_COLLECTION,
-            vectors_config=qmodels.VectorParams(
-                size=EMBED_DIM, distance=qmodels.Distance.COSINE
-            ),
-        )
-        # Indexed payload field — required to filter on expire_at efficiently.
-        await app.state.qdrant.create_payload_index(
-            collection_name=CACHE_COLLECTION,
-            field_name="expire_at",
-            field_schema=qmodels.PayloadSchemaType.INTEGER,
-        )
+    # Payload index so the expire_at filter stays fast as the collection grows.
+    await app.state.qdrant.create_payload_index(
+        collection_name=CACHE_COLLECTION,
+        field_name="expire_at",
+        field_schema=qmodels.PayloadSchemaType.INTEGER,
+    )
     try:
         yield
     finally:
