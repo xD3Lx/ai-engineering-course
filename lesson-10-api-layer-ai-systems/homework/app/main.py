@@ -432,45 +432,58 @@ async def replay_cached(
     request_id: str,
     api_key: str,
     start_ts: float,
+    redis: aioredis.Redis,
+    request: Request,
 ):
     """Stream a cached response back token-by-token so the UX matches a fresh
     call (same SSE event shape, same word-aligned chunking). Logs the request
-    into ``usage_log`` once the stream completes."""
-    response = payload.get("response", "")
-    ttft_ms: int | None = None
-    # Word-by-word replay keeps each event aligned to a whitespace boundary,
-    # matching the live-streaming buffer's behavior.
-    for word in response.split(" "):
-        if word == "":
-            continue
-        if ttft_ms is None:
-            ttft_ms = int((time.time() - start_ts) * 1000)
-        yield sse({"type": "token", "content": word + " "})
-    yield sse({
-        "type": "done",
-        "model": payload.get("model"),
-        "tier": tier,
-        "usage": {"input_tokens": 0, "output_tokens": 0, "estimated": False},
-        "cost_usd": 0.0,
-        "cache_hit": True,
-        "cache_score": payload.get("score"),
-        "sources": payload.get("sources", []),
-        "request_id": request_id,
-    })
-    latency_ms = int((time.time() - start_ts) * 1000)
-    await log_usage(
-        request_id=request_id,
-        api_key=api_key,
-        model=payload.get("model", "unknown"),
-        # Cache hits don't burn upstream tokens — store 0 so daily token totals
-        # reflect actual LLM consumption, not the saved-by-cache amount.
-        input_tokens=0,
-        output_tokens=0,
-        latency_ms=latency_ms,
-        ttft_ms=ttft_ms,
-        cache_hit=True,
-        fallback_used=bool(payload.get("fallback_used", False)),
-    )
+    into ``usage_log`` and bumps the global stream counters on the way out so
+    cache hits show up in /health alongside LLM-served requests."""
+    completed = False
+    try:
+        response = payload.get("response", "")
+        ttft_ms: int | None = None
+        # Word-by-word replay keeps each event aligned to a whitespace boundary,
+        # matching the live-streaming buffer's behavior.
+        for word in response.split(" "):
+            if word == "":
+                continue
+            if await request.is_disconnected():
+                # Client gave up mid-replay — finally-block records the abort.
+                return
+            if ttft_ms is None:
+                ttft_ms = int((time.time() - start_ts) * 1000)
+            yield sse({"type": "token", "content": word + " "})
+        yield sse({
+            "type": "done",
+            "model": payload.get("model"),
+            "tier": tier,
+            "usage": {"input_tokens": 0, "output_tokens": 0, "estimated": False},
+            "cost_usd": 0.0,
+            "cache_hit": True,
+            "cache_score": payload.get("score"),
+            "sources": payload.get("sources", []),
+            "request_id": request_id,
+        })
+        latency_ms = int((time.time() - start_ts) * 1000)
+        await log_usage(
+            request_id=request_id,
+            api_key=api_key,
+            model=payload.get("model", "unknown"),
+            # Cache hits don't burn upstream tokens — store 0 so daily token totals
+            # reflect actual LLM consumption, not the saved-by-cache amount.
+            input_tokens=0,
+            output_tokens=0,
+            latency_ms=latency_ms,
+            ttft_ms=ttft_ms,
+            cache_hit=True,
+            fallback_used=bool(payload.get("fallback_used", False)),
+        )
+        completed = True
+    finally:
+        await metric_incr(
+            redis, "completed_streams" if completed else "aborted_streams"
+        )
 
 
 @app.post("/chat/stream")
@@ -502,6 +515,8 @@ async def chat_stream(
                 request_id=request_id,
                 api_key=caller.api_key,
                 start_ts=start_ts,
+                redis=redis,
+                request=request,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
