@@ -27,6 +27,9 @@ from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 from qdrant_client import AsyncQdrantClient
+from redis.asyncio.retry import Retry
+from redis.backoff import ExponentialBackoff
+from redis.exceptions import ConnectionError as RedisConnectionError, TimeoutError as RedisTimeoutError
 
 from .auth import Caller, require_api_key
 from .cache import (
@@ -68,8 +71,20 @@ async def lifespan(app: FastAPI):
     )
     # Upstash exposes a regular RESP endpoint at rediss://... that works
     # transparently with redis-py — REST is only needed in serverless runtimes.
+    #
+    # Managed Redis (Upstash, ElastiCache, etc.) reaps idle TCP connections,
+    # which surfaces here as "Connection reset by peer" on the next command.
+    # Three guards together keep the client healthy:
+    #   - health_check_interval: PING every 30s to detect dead conns early
+    #   - socket_keepalive: OS-level TCP keepalive on the socket
+    #   - retry: transparently reconnect + retry on connection errors
     app.state.redis = aioredis.from_url(
-        os.environ["REDIS_URL"], decode_responses=True
+        os.environ["REDIS_URL"],
+        decode_responses=True,
+        health_check_interval=30,
+        socket_keepalive=True,
+        retry=Retry(ExponentialBackoff(cap=1, base=0.1), retries=3),
+        retry_on_error=[RedisConnectionError, RedisTimeoutError, ConnectionResetError],
     )
     # ``:memory:`` runs the whole vector store inside this process — no server
     # required, but the cache is wiped on restart and not shared across instances.
