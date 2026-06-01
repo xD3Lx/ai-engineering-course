@@ -45,6 +45,7 @@ from .rag import EMBED_DIM, embed, init_embedder, retrieve
 from .ratelimit import (
     WINDOW_SECONDS,
     estimate_tokens,
+    observed_average_tokens,
     quota_refund,
     quota_reserve,
     quota_settle,
@@ -157,9 +158,10 @@ async def chat_stream(
         {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {body.message}"},
     ]
 
-    # Reserve worst-case budget atomically. This is what makes parallel bursts
+    # Reserve an expected budget atomically. This is what makes parallel bursts
     # actually get capped — INCRBY serializes the concurrent reservations.
-    reservation = estimate_tokens(messages, limit)
+    average_tokens = await observed_average_tokens(redis, caller.api_key)
+    reservation = estimate_tokens(messages, limit, average_tokens)
     retry_after = await quota_reserve(redis, caller.api_key, reservation, limit)
     if retry_after:
         raise HTTPException(

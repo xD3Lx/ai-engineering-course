@@ -8,7 +8,7 @@ TIERS: dict[str, dict] = {
     "demo-free": {
         "token_limit": 5_000,
         "models": [
-            "meta-llama/llama-3.2-3b-instruct:free",
+            "openai/gpt-oss-20b:free",
             "google/gemma-4-31b-it:free",
             "meta-llama/llama-3.3-70b-instruct:free",
         ],
