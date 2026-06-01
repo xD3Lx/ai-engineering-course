@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import redis.asyncio as aioredis
 
-WINDOW_SECONDS = 180  # bucket TTL — fully refills this long after the first write
+WINDOW_SECONDS = 90  # bucket TTL — fully refills this long after the first write
 
 
 def quota_key(api_key: str) -> str:
