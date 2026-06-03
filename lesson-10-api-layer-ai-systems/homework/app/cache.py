@@ -143,6 +143,7 @@ async def replay_cached(
             if ttft_ms is None:
                 ttft_ms = int((time.time() - start_ts) * 1000)
             yield _sse({"type": "token", "content": word + " "})
+        latency_ms = int((time.time() - start_ts) * 1000)
         yield _sse({
             "type": "done",
             "model": payload.get("model"),
@@ -153,8 +154,9 @@ async def replay_cached(
             "cache_score": payload.get("score"),
             "sources": payload.get("sources", []),
             "request_id": request_id,
+            "latency_ms": latency_ms,
+            "ttft_ms": ttft_ms,
         })
-        latency_ms = int((time.time() - start_ts) * 1000)
         await log_usage(
             request_id=request_id,
             api_key=api_key,

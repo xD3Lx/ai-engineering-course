@@ -236,6 +236,7 @@ async def chat_stream(
                     output_tokens=out,
                     fallback_used=fallback_used,
                 )
+            latency_ms = int((time.time() - start_ts) * 1000)
             yield sse({
                 "type": "done",
                 "model": model_name,
@@ -247,9 +248,10 @@ async def chat_stream(
                 "fallback_used": fallback_used,
                 "sources": sources,
                 "request_id": request_id,
+                "latency_ms": latency_ms,
+                "ttft_ms": ttft_ms,
             })
             completed = True
-            latency_ms = int((time.time() - start_ts) * 1000)
             await log_usage(
                 request_id=request_id,
                 api_key=caller.api_key,
