@@ -60,6 +60,7 @@ from .ratelimit import (
     quota_reserve,
     quota_settle,
 )
+from . import tracing
 from .tiers import TIERS, fallback_chain, token_limit
 from .usage_log import (
     ensure_usage_log,
@@ -111,9 +112,12 @@ async def lifespan(app: FastAPI):
     app.state.qdrant = AsyncQdrantClient(location=":memory:")
     await ensure_cache_collection(app.state.qdrant, EMBED_DIM)
     await ensure_usage_log()
+    # Langfuse tracing — no-op if LANGFUSE_* env vars are unset.
+    tracing.init_tracing()
     try:
         yield
     finally:
+        tracing.shutdown()  # flush buffered spans before exit
         await app.state.redis.aclose()
         await app.state.qdrant.close()
 
@@ -146,9 +150,36 @@ async def chat_stream(
     request_id = str(uuid.uuid4())
     start_ts = time.time()
 
+    # --- Langfuse trace: one root span per request, spanning the whole
+    # pipeline (auth → rate limit → embed → cache → vector search → LLM →
+    # stream). Child spans are ended as each step finishes; the root is ended
+    # in gen()'s cleanup (or on an early-return error path below).
+    trace = tracing.start_root(
+        "chat_stream",
+        input={"message": body.message},
+        metadata={"request_id": request_id, "tier": caller.tier, "api_key": caller.api_key},
+    )
+    tracing.set_trace(
+        trace,
+        name="chat_stream",
+        user_id=caller.api_key,
+        tags=[f"tier:{caller.tier}"],
+        metadata={"request_id": request_id},
+    )
+    # Auth already ran in the require_api_key dependency — record it as a step.
+    tracing.end(
+        tracing.start_child(trace, "auth", input={"api_key": caller.api_key}),
+        output={"tier": caller.tier},
+    )
+
     # --- input guardrails ---------------------------------------------------
+    guard_span = tracing.start_child(
+        trace, "input_guardrails", input={"chars": len(body.message)}
+    )
     # Length cap: reject oversized input before any embedding / LLM work.
     if len(body.message) > MAX_INPUT_CHARS:
+        tracing.end(guard_span, output="rejected: too_long", level="WARNING")
+        tracing.end(trace, output={"status": "rejected", "reason": "input_too_long"})
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Input too long: {len(body.message)} chars (max {MAX_INPUT_CHARS}).",
@@ -162,21 +193,53 @@ async def chat_stream(
             pattern=matched_pattern,
             message=body.message,
         )
+        tracing.end(
+            guard_span, output="rejected: injection",
+            metadata={"pattern": matched_pattern}, level="WARNING",
+        )
+        tracing.end(trace, output={"status": "rejected", "reason": "prompt_injection"})
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Input rejected: prompt-injection pattern detected.",
         )
     # Neutralize any forged XML delimiters before the input enters the prompt.
     safe_message = sanitize_user_input(body.message)
+    tracing.end(guard_span, output="passed")
 
     # Single embedding call, reused for cache lookup and RAG retrieval.
+    embed_span = tracing.start_child(trace, "embed_query", input={"message": body.message})
     vec = embed(body.message)
+    tracing.end(embed_span, output={"embedding_dim": len(vec)})
 
     # Semantic cache check. A HIT short-circuits the LLM call entirely — no
     # rate-limit charge, no upstream tokens, just replay the stored response.
+    cache_span = tracing.start_child(trace, "cache_check")
     cached = await cache_lookup(qdrant, vec)
     if cached is not None:
         await metric_incr(redis, "cache_hits")
+        tracing.end(cache_span, output={"cache_hit": True, "score": cached.get("score")})
+        # Record the cached answer as a generation so cache hits show the same
+        # prompt/completion shape as live calls. We have the full payload here,
+        # so the trace is complete without threading into the replay generator.
+        cached_model = cached.get("model")
+        cache_gen = tracing.start_child(
+            trace, "llm_call", as_type="generation",
+            model=cached_model,
+            input={"cached_query": cached.get("query")},
+            metadata={
+                "model": cached_model, "api_key": caller.api_key, "tier": caller.tier,
+                "cache_hit": True, "fallback_used": bool(cached.get("fallback_used")),
+            },
+        )
+        tracing.end(
+            cache_gen, output=cached.get("response", ""),
+            usage_details={"input": 0, "output": 0, "total": 0},
+        )
+        tracing.set_trace(trace, tags=[
+            f"tier:{caller.tier}", f"model:{cached_model}",
+            "cache_hit:true", f"fallback:{bool(cached.get('fallback_used'))}",
+        ])
+        tracing.end(trace, output={"cache_hit": True})
         return StreamingResponse(
             replay_cached(
                 cached, caller.tier,
@@ -190,11 +253,14 @@ async def chat_stream(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
     await metric_incr(redis, "cache_misses")
+    tracing.end(cache_span, output={"cache_hit": False})
 
     # MISS — RAG using the same vector, then build the prompt as usual.
+    search_span = tracing.start_child(trace, "vector_search", input={"message": body.message})
     rows = await retrieve(vec)
     sources = [f"chunk_{i}" for i, _ in rows]
     context = "\n\n".join(f"[chunk_{i}] {c}" for i, c in rows)
+    tracing.end(search_span, output={"sources": sources, "num_chunks": len(rows)})
     # Role separation + XML envelopes around untrusted data. The system prompt
     # explicitly tells the model to treat tag contents as data, not commands,
     # so user input can't override the instructions.
@@ -210,11 +276,18 @@ async def chat_stream(
     # actually get capped — INCRBY serializes the concurrent reservations.
     average_tokens = await observed_average_tokens(redis, caller.api_key)
     reservation = estimate_tokens(messages, limit, average_tokens)
+    rl_span = tracing.start_child(
+        trace, "rate_limit", input={"reservation": reservation, "limit": limit}
+    )
     retry_after = await quota_reserve(redis, caller.api_key, reservation, limit)
     if retry_after:
         # Rate-limited before the stream ever opened — count it as an aborted
         # stream so /health reflects requests that never produced tokens.
         await metric_incr(redis, "aborted_streams")
+        tracing.end(
+            rl_span, output={"allowed": False, "retry_after": retry_after}, level="WARNING"
+        )
+        tracing.end(trace, output={"status": "rate_limited"})
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=(
@@ -223,12 +296,24 @@ async def chat_stream(
             ),
             headers={"Retry-After": str(retry_after)},
         )
+    tracing.end(rl_span, output={"allowed": True})
 
     # Concurrency gate: acquire a slot before touching OpenRouter. During a
     # spike this awaits here rather than opening more upstream streams than
     # MAX_CONCURRENT_LLM. The slot is released in gen()'s finally (or below if
     # the open fails). acquire() is cancellation-safe (frees itself on cancel).
     llm_sem: asyncio.Semaphore = request.app.state.llm_sem
+
+    # LLM generation span — input is the full prompt (system + retrieved chunks
+    # + user query) for debugging hallucinations / RAG retrieval. Output, usage
+    # and cost are filled in once streaming completes; the span is ended in
+    # gen()'s cleanup so it stays open for the whole stream.
+    llm_gen = tracing.start_child(
+        trace, "llm_call", as_type="generation",
+        input={"messages": messages},
+        metadata={"api_key": caller.api_key, "tier": caller.tier},
+    )
+
     await llm_sem.acquire()
 
     # Open the LLM stream, trying each model in the fallback chain.
@@ -241,10 +326,22 @@ async def chat_stream(
         # reservation so the caller isn't billed for a stream that never began.
         llm_sem.release()
         await quota_refund(redis, caller.api_key, reservation)
+        tracing.end(llm_gen, output="open_failed", level="ERROR")
+        tracing.end(trace, output={"status": "error", "reason": "all_models_failed"})
         raise
 
     # Stream is open and about to consume upstream tokens — it's now active.
     await metric_incr(redis, "active_streams", 1)
+    # Record the actually-used model + tags now that the stream is open, so the
+    # trace is tagged even if the client disconnects mid-stream.
+    tracing.update(llm_gen, model=model_name, metadata={
+        "model": model_name, "fallback_used": fallback_used,
+        "api_key": caller.api_key, "tier": caller.tier, "cache_hit": False,
+    })
+    tracing.set_trace(trace, tags=[
+        f"tier:{caller.tier}", f"model:{model_name}",
+        "cache_hit:false", f"fallback:{fallback_used}",
+    ])
 
     async def gen():
         completed = False
@@ -316,6 +413,21 @@ async def chat_stream(
                     output_tokens=out,
                     fallback_used=fallback_used,
                 )
+            # Fill in the LLM generation span: the prompt went in as input;
+            # here we attach the completion, token usage, cost, and run flags
+            # (for debugging hallucinations and RAG retrieval issues).
+            tracing.update(
+                llm_gen,
+                output=full_response,
+                usage_details={"input": inp, "output": out, "total": inp + out},
+                cost_details={"total": cost_usd(model_name, inp, out)},
+                metadata={
+                    "model": model_name, "api_key": caller.api_key, "tier": caller.tier,
+                    "cache_hit": False, "fallback_used": fallback_used,
+                    "output_filtered": output_filtered, "estimated": estimated,
+                    "prompt_cache_hit": prompt_cache_hit,
+                },
+            )
             latency_ms = int((time.time() - start_ts) * 1000)
             yield sse({
                 "type": "done",
@@ -365,6 +477,12 @@ async def chat_stream(
             # Shield so a client-disconnect cancellation still runs cleanup to
             # completion: upstream closed, reservation refunded, gauges fixed.
             await asyncio.shield(_cleanup())
+
+            # Close out the Langfuse generation + trace. Sync + buffered, so
+            # this is cheap and safe even on the abort path (output set above
+            # only on the success branch; an aborted stream ends with none).
+            tracing.end(llm_gen, metadata={"completed": completed})
+            tracing.end(trace, output={"completed": completed, "request_id": request_id})
 
     return StreamingResponse(
         gen(),

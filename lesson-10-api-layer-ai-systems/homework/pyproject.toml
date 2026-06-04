@@ -18,6 +18,10 @@ dependencies = [
     # Semantic response cache — Qdrant for the cache vectors (separate from
     # the pgvector RAG store) because Upstash Redis has no vector search.
     "qdrant-client>=1.10.0",
+    # Observability — Langfuse Cloud tracing (OpenTelemetry-based v3 SDK).
+    # Optional at runtime: the app no-ops tracing when LANGFUSE_* env vars
+    # are unset, but the package must be installed for tracing to activate.
+    "langfuse>=3.0.0",
 ]
 
 #[build-system]
