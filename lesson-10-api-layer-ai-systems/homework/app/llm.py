@@ -67,17 +67,56 @@ def _record_success(model: str) -> None:
     state["open_until"] = 0.0
 
 
+# OpenRouter returns 400 for an unrecognized model ID (deprecated, renamed, or
+# mistyped) because ``model`` is a body param, not part of the URL. That's the
+# one 400 where another model in the chain might still succeed, so we detect it
+# from the error body and let it fall back — every other 400 stays terminal.
+_MODEL_NOT_FOUND_MARKERS = (
+    "not a valid model",
+    "is not a valid model id",
+    "model not found",
+    "no endpoints found",
+    "invalid model",
+    "unknown model",
+)
+
+
+def _is_model_not_found(exc: APIStatusError) -> bool:
+    """Best-effort detection of a 'model does not exist' 400 from the error body."""
+    parts: list[str] = []
+    msg = getattr(exc, "message", None)
+    if msg:
+        parts.append(str(msg))
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            parts.append(str(err.get("message", "")))
+            parts.append(str(err.get("code", "")))
+        elif err:
+            parts.append(str(err))
+        parts.append(str(body.get("message", "")))
+    parts.append(str(exc))
+    haystack = " ".join(parts).lower()
+    return any(marker in haystack for marker in _MODEL_NOT_FOUND_MARKERS)
+
+
 def _is_retryable(exc: Exception) -> bool:
     """Whether ``exc`` should trigger a fallback to the next model.
 
-    Retryable: timeouts (our wait_for or the SDK's), network errors, and
-    429/5xx from upstream. Non-retryable: 400/401/403/422 and content-filter
-    rejections (surfaced as 400) — these won't succeed on another model.
+    Retryable: timeouts (our wait_for or the SDK's), network errors, 429/5xx
+    from upstream, and a 400 that specifically signals an invalid/deprecated
+    model ID. Non-retryable: 401/403/422, content-filter rejections, and any
+    other 400 (bad input) — these won't succeed on another model.
     """
     if isinstance(exc, (asyncio.TimeoutError, APITimeoutError, APIConnectionError)):
         return True
     if isinstance(exc, APIStatusError):
         code = exc.status_code
+        # A model-not-found 400 is worth trying on the next model in the chain;
+        # all other 400s (bad request, content filter) are the caller's problem.
+        if code == 400 and _is_model_not_found(exc):
+            return True
         if code in NON_RETRYABLE_STATUS:
             return False
         if code in RETRYABLE_STATUS:

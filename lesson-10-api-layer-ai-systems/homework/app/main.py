@@ -164,6 +164,9 @@ async def chat_stream(
     reservation = estimate_tokens(messages, limit, average_tokens)
     retry_after = await quota_reserve(redis, caller.api_key, reservation, limit)
     if retry_after:
+        # Rate-limited before the stream ever opened — count it as an aborted
+        # stream so /health reflects requests that never produced tokens.
+        await metric_incr(redis, "aborted_streams")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=(
