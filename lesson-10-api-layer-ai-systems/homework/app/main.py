@@ -38,6 +38,15 @@ from .cache import (
     ensure_collection as ensure_cache_collection,
     replay_cached,
 )
+from .guardrails import (
+    MAX_INPUT_CHARS,
+    SYSTEM_PROMPT,
+    detect_injection,
+    log_suspicious_request,
+    log_suspicious_response,
+    sanitize_user_input,
+    scan_output,
+)
 from .llm import extract_usage, open_with_fallback
 from .metrics import metric_incr, metrics_snapshot
 from .pricing import cost_usd
@@ -127,6 +136,29 @@ async def chat_stream(
     request_id = str(uuid.uuid4())
     start_ts = time.time()
 
+    # --- input guardrails ---------------------------------------------------
+    # Length cap: reject oversized input before any embedding / LLM work.
+    if len(body.message) > MAX_INPUT_CHARS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Input too long: {len(body.message)} chars (max {MAX_INPUT_CHARS}).",
+        )
+    # Prompt-injection detection: log the hit, then reject.
+    matched_pattern = detect_injection(body.message)
+    if matched_pattern is not None:
+        log_suspicious_request(
+            api_key=caller.api_key,
+            request_id=request_id,
+            pattern=matched_pattern,
+            message=body.message,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Input rejected: prompt-injection pattern detected.",
+        )
+    # Neutralize any forged XML delimiters before the input enters the prompt.
+    safe_message = sanitize_user_input(body.message)
+
     # Single embedding call, reused for cache lookup and RAG retrieval.
     vec = embed(body.message)
 
@@ -153,9 +185,15 @@ async def chat_stream(
     rows = await retrieve(vec)
     sources = [f"chunk_{i}" for i, _ in rows]
     context = "\n\n".join(f"[chunk_{i}] {c}" for i, c in rows)
+    # Role separation + XML envelopes around untrusted data. The system prompt
+    # explicitly tells the model to treat tag contents as data, not commands,
+    # so user input can't override the instructions.
     messages = [
-        {"role": "system", "content": "Answer using only the provided context. Be concise."},
-        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {body.message}"},
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            f"<context>\n{context}\n</context>\n\n"
+            f"<user_query>\n{safe_message}\n</user_query>"
+        )},
     ]
 
     # Reserve an expected budget atomically. This is what makes parallel bursts
@@ -227,11 +265,24 @@ async def chat_stream(
             # Reconcile the reservation with what we actually used. This
             # converts the worst-case hold into the real charge.
             await quota_settle(redis, caller.api_key, reservation, inp + out)
+            # Output filtering (post-stream): scan the accumulated answer for
+            # leaked system-prompt fragments. Live-blocking mid-stream isn't
+            # required — we flag the record and log it after the fact.
+            leaked_fragment = scan_output(full_response)
+            output_filtered = leaked_fragment is not None
+            if output_filtered:
+                log_suspicious_response(
+                    api_key=caller.api_key,
+                    request_id=request_id,
+                    fragment=leaked_fragment,
+                    response=full_response,
+                )
             # Store the completed response in the semantic cache so the next
             # similar question can short-circuit the LLM. Token counts and the
             # fallback flag travel with the payload so future cache hits log
-            # with the original request's context.
-            if full_response.strip():
+            # with the original request's context. A flagged response is NOT
+            # cached, so we don't replay leaked content to future callers.
+            if full_response.strip() and not output_filtered:
                 await cache_store(
                     qdrant, vec, body.message, full_response,
                     model_name, sources,
@@ -253,6 +304,7 @@ async def chat_stream(
                 "request_id": request_id,
                 "latency_ms": latency_ms,
                 "ttft_ms": ttft_ms,
+                "output_filtered": output_filtered,
             })
             completed = True
             await log_usage(
@@ -265,6 +317,7 @@ async def chat_stream(
                 ttft_ms=ttft_ms,
                 cache_hit=False,
                 fallback_used=fallback_used,
+                output_filtered=output_filtered,
             )
         finally:
             await resp.close()  # cancels the upstream HTTP request → stops billing

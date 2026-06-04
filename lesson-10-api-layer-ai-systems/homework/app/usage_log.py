@@ -23,10 +23,14 @@ CREATE TABLE IF NOT EXISTS usage_log (
     ttft_ms       INT,
     cache_hit     BOOLEAN      NOT NULL,
     fallback_used BOOLEAN      NOT NULL,
+    output_filtered BOOLEAN    NOT NULL DEFAULT FALSE,
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS usage_log_api_key_created_at
     ON usage_log (api_key, created_at DESC);
+-- Backfill the column on databases created before output filtering existed.
+ALTER TABLE usage_log
+    ADD COLUMN IF NOT EXISTS output_filtered BOOLEAN NOT NULL DEFAULT FALSE;
 """
 
 
@@ -48,6 +52,7 @@ async def log_usage(
     ttft_ms: int | None,
     cache_hit: bool,
     fallback_used: bool,
+    output_filtered: bool = False,
 ) -> None:
     """Insert a single usage row. Cost is computed from pricing.cost_usd."""
     cost = cost_usd(model, input_tokens, output_tokens)
@@ -57,13 +62,15 @@ async def log_usage(
                 """
                 INSERT INTO usage_log (
                     request_id, api_key, model, input_tokens, output_tokens,
-                    cost_usd, latency_ms, ttft_ms, cache_hit, fallback_used
+                    cost_usd, latency_ms, ttft_ms, cache_hit, fallback_used,
+                    output_filtered
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     request_id, api_key, model, input_tokens, output_tokens,
                     cost, latency_ms, ttft_ms, cache_hit, fallback_used,
+                    output_filtered,
                 ),
             )
         await conn.commit()
