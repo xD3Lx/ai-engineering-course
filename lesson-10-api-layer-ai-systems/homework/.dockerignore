@@ -24,6 +24,11 @@ Dockerfile
 .pytest_cache/
 .coverage
 
+# Runtime artifacts that shouldn't be baked into the image
+logs/
+fly.toml
+docker-compose.yaml
+
 # IDE
 .vscode/
 .idea/

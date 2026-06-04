@@ -1,46 +1,61 @@
-# Use a Python image with uv pre-installed
-FROM ghcr.io/astral-sh/uv:python3.14-trixie-slim
+# syntax=docker/dockerfile:1
 
-# Setup a non-root user
-RUN groupadd --system --gid 999 nonroot \
- && useradd --system --gid 999 --uid 999 --create-home nonroot
+# ---------------------------------------------------------------------------
+# Stage 1 — builder: resolve + install dependencies into /app/.venv with uv.
+# The uv binary, build caches, and toolchain stay in this stage and never
+# reach the final image.
+# ---------------------------------------------------------------------------
+FROM ghcr.io/astral-sh/uv:python3.14-trixie-slim AS builder
 
-# Install the project into `/app`
 WORKDIR /app
 
-# Enable bytecode compilation
-ENV UV_COMPILE_BYTECODE=1
+# uv build settings:
+#   - compile bytecode for faster cold starts
+#   - copy (not hardlink) so the venv is self-contained and copyable to stage 2
+#   - skip dev dependencies
+#   - use the image's Python (don't download a standalone interpreter), so the
+#     venv references /usr/local/bin/python — which also exists in the runtime
+#     image, keeping the copied venv valid.
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_NO_DEV=1 \
+    UV_PYTHON_DOWNLOADS=0
 
-# Copy from the cache instead of linking since it's a mounted volume
-ENV UV_LINK_MODE=copy
-
-# Omit development dependencies
-ENV UV_NO_DEV=1
-
-# Ensure installed tools can be executed out of the box
-ENV UV_TOOL_BIN_DIR=/usr/local/bin
-
-# Install the project's dependencies using the lockfile and settings
+# Install dependencies first, without the project, for optimal layer caching.
+# The uv cache is a BuildKit cache mount, so it never lands in any image layer.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --locked --no-install-project
+    uv sync --locked --no-install-project --no-dev
 
-# Then, add the rest of the project source code and install it
-# Installing separately from its dependencies allows optimal layer caching
+# Then add the source and install the project itself.
 COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked
+    uv sync --locked --no-dev
 
-# Place executables in the environment at the front of the path
-ENV PATH="/app/.venv/bin:$PATH"
+# ---------------------------------------------------------------------------
+# Stage 2 — runtime: a clean Python image with only the venv + app source.
+# No uv, no build caches, no compiler toolchain.
+# ---------------------------------------------------------------------------
+FROM python:3.14-slim-trixie AS runtime
 
-# Reset the entrypoint, don't invoke `uv`
-ENTRYPOINT []
+# Non-root user
+RUN groupadd --system --gid 999 nonroot \
+ && useradd --system --gid 999 --uid 999 --create-home nonroot
 
-# Use the non-root user to run our application
+WORKDIR /app
+
+# Copy the fully-built application (source + /app/.venv) from the builder.
+COPY --from=builder --chown=nonroot:nonroot /app /app
+
+# Put the venv on PATH; sensible Python runtime defaults.
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
 USER nonroot
 
-# Run the FastAPI application by default
-# Uses `--host 0.0.0.0` to allow access from outside the container
-CMD ["uvicorn", "app.main:app", "--env-file", ".env" ,"--host", "0.0.0.0", "--port", "8080"]
+EXPOSE 8080
+
+# Run the FastAPI app. `--host 0.0.0.0` to allow access from outside the container.
+CMD ["uvicorn", "app.main:app", "--env-file", ".env", "--host", "0.0.0.0", "--port", "8080"]

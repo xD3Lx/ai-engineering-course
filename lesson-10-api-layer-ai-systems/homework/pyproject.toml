@@ -22,7 +22,21 @@ dependencies = [
     # Optional at runtime: the app no-ops tracing when LANGFUSE_* env vars
     # are unset, but the package must be installed for tracing to activate.
     "langfuse>=3.0.0",
+    # Pin torch explicitly so we can force the CPU-only build below. The model
+    # runs on CPU, so the default CUDA wheel (~5-6 GB of NVIDIA libs) is pure
+    # bloat — the CPU wheel is ~200 MB.
+    "torch>=2.2.0",
 ]
+
+# Install torch from PyTorch's CPU-only wheel index instead of PyPI's default
+# (CUDA) build. This is the single biggest lever on image size.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
 
 #[build-system]
 #requires = ["hatchling"]
