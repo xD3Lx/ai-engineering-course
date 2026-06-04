@@ -15,6 +15,7 @@ context, and the request handlers. The actual mechanics live in:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -68,6 +69,13 @@ from .usage_log import (
 )
 
 
+# Cap on concurrent in-flight LLM streams per process. Bounds load on
+# OpenRouter (which has its own rate limits) and caps memory during traffic
+# spikes — excess requests await a free slot instead of all hitting upstream
+# at once. The semaphore lives on app.state so it's one shared instance.
+MAX_CONCURRENT_LLM = 20
+
+
 # ---------------------------------------------------------------------------
 # Lifespan: load the embedder, open clients to OpenRouter / Redis / Qdrant,
 # make sure the cache collection and usage_log table exist.
@@ -75,6 +83,8 @@ from .usage_log import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_embedder()
+    # Concurrency limiter for upstream LLM streams (see MAX_CONCURRENT_LLM).
+    app.state.llm_sem = asyncio.Semaphore(MAX_CONCURRENT_LLM)
     app.state.llm = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=os.environ["OPENROUTER_API_KEY"],
@@ -214,16 +224,27 @@ async def chat_stream(
             headers={"Retry-After": str(retry_after)},
         )
 
+    # Concurrency gate: acquire a slot before touching OpenRouter. During a
+    # spike this awaits here rather than opening more upstream streams than
+    # MAX_CONCURRENT_LLM. The slot is released in gen()'s finally (or below if
+    # the open fails). acquire() is cancellation-safe (frees itself on cancel).
+    llm_sem: asyncio.Semaphore = request.app.state.llm_sem
+    await llm_sem.acquire()
+
     # Open the LLM stream, trying each model in the fallback chain.
     try:
         resp, model_name, fallback_used = await open_with_fallback(
             llm, fallback_chain(caller.tier), messages, limit
         )
-    except Exception:
-        # All models failed to open — refund the reservation we just made so
-        # the caller isn't billed for a stream that never started.
+    except BaseException:
+        # Open failed or was cancelled — free the slot and refund the
+        # reservation so the caller isn't billed for a stream that never began.
+        llm_sem.release()
         await quota_refund(redis, caller.api_key, reservation)
         raise
+
+    # Stream is open and about to consume upstream tokens — it's now active.
+    await metric_incr(redis, "active_streams", 1)
 
     async def gen():
         completed = False
@@ -244,7 +265,12 @@ async def chat_stream(
                 if not piece:
                     continue
                 if await request.is_disconnected():
-                    return  # finally-block bumps aborted_streams + closes resp
+                    # Early-out on client disconnect. (A disconnect also raises
+                    # CancelledError through `async for chunk in resp` into the
+                    # SDK, aborting the upstream request — this is the graceful
+                    # path that avoids waiting for the next chunk.) The finally
+                    # block frees the slot, refunds, and bumps aborted_streams.
+                    return
                 if ttft_ms is None:
                     ttft_ms = int((time.time() - start_ts) * 1000)
                 output_chars += len(piece)
@@ -320,14 +346,25 @@ async def chat_stream(
                 output_filtered=output_filtered,
             )
         finally:
-            await resp.close()  # cancels the upstream HTTP request → stops billing
-            if not completed:
-                # Stream aborted (client disconnect, exception, etc.) — refund
-                # the full reservation since we never got a real usage figure.
-                await quota_refund(redis, caller.api_key, reservation)
-            await metric_incr(
-                redis, "completed_streams" if completed else "aborted_streams"
-            )
+            # release() is synchronous, so the slot is freed immediately even
+            # if the cleanup awaits below are interrupted by cancellation.
+            llm_sem.release()
+
+            async def _cleanup() -> None:
+                await resp.close()  # cancels the upstream HTTP request → stops billing
+                await metric_incr(redis, "active_streams", -1)
+                if not completed:
+                    # Aborted (client disconnect, exception, etc.) — refund the
+                    # full reservation; no settle, so tokens never hit the rate
+                    # limiter and nothing is written to the cost tracker.
+                    await quota_refund(redis, caller.api_key, reservation)
+                await metric_incr(
+                    redis, "completed_streams" if completed else "aborted_streams"
+                )
+
+            # Shield so a client-disconnect cancellation still runs cleanup to
+            # completion: upstream closed, reservation refunded, gauges fixed.
+            await asyncio.shield(_cleanup())
 
     return StreamingResponse(
         gen(),
@@ -342,6 +379,9 @@ async def health(request: Request):
     return {
         "status": "ok",
         "tiers": {tier: fallback_chain(tier) for tier in TIERS},
+        # Gauge: streams consuming an LLM slot right now. Clamped at 0 in case
+        # a hard cancellation ever skips a decrement.
+        "active_streams": max(0, snap.get("active_streams", 0)),
         "completed_streams": snap.get("completed_streams", 0),
         "aborted_streams": snap.get("aborted_streams", 0),
         "cache_hits": snap.get("cache_hits", 0),
