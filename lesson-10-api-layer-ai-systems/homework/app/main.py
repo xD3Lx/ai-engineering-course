@@ -107,9 +107,21 @@ async def lifespan(app: FastAPI):
         retry=Retry(ExponentialBackoff(cap=1, base=0.1), retries=3),
         retry_on_error=[RedisConnectionError, RedisTimeoutError, ConnectionResetError],
     )
-    # ``:memory:`` runs the whole vector store inside this process — no server
-    # required, but the cache is wiped on restart and not shared across instances.
-    app.state.qdrant = AsyncQdrantClient(location=":memory:")
+    # Qdrant Cloud when QDRANT_URL is set — a persistent, managed vector store
+    # shared across instances (the semantic cache survives restarts and is hit
+    # by every worker). Falls back to an in-process ``:memory:`` store for local
+    # dev, which needs no server but is wiped on restart and not shared.
+    qdrant_url = os.environ.get("QDRANT_URL")
+    if qdrant_url:
+        app.state.qdrant = AsyncQdrantClient(
+            url=qdrant_url,
+            api_key=os.environ.get("QDRANT_API_KEY"),
+            # Cloud round-trips are slower than in-process; give upserts/queries
+            # headroom so a slow network blip doesn't surface as an error.
+            timeout=30,
+        )
+    else:
+        app.state.qdrant = AsyncQdrantClient(location=":memory:")
     await ensure_cache_collection(app.state.qdrant, EMBED_DIM)
     await ensure_usage_log()
     # Langfuse tracing — no-op if LANGFUSE_* env vars are unset.
