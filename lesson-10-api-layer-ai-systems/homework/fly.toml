@@ -3,7 +3,7 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'homework-10-api'
+app = 'homework-10-final'
 primary_region = 'fra'
 
 [build]
@@ -18,5 +18,6 @@ primary_region = 'fra'
 
 [[vm]]
   memory = '1gb'
+  cpu_kind = 'shared'
   cpus = 1
   memory_mb = 1024

@@ -7,12 +7,7 @@ services:
     ports:
       - "8080:8080"
 
-    environment:
-      # Include development dependencies when working locally
-      - UV_NO_DEV=0
-
     # Run as root during development so the environment is mutable
-    # Alternatively, you could set `UV_PROJECT_ENVIRONMENT` to a path owned by the non-root user
     user: root
 
     volumes:
@@ -36,6 +31,6 @@ services:
           ignore:
             - .venv/
 
-        # Rebuild the image if dependencies change by checking uv.lock
+        # Rebuild the image if dependencies change by checking requirements.txt
         - action: rebuild
-          path: ./uv.lock
+          path: ./requirements.txt

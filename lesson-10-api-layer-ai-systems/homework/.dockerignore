@@ -26,8 +26,13 @@ Dockerfile
 
 # Runtime artifacts that shouldn't be baked into the image
 logs/
+*.log
+test.txt
 fly.toml
 docker-compose.yaml
+
+# Not needed in the pip-based build (kept in repo for regenerating requirements)
+uv.lock
 
 # IDE
 .vscode/

@@ -1,41 +1,33 @@
 # syntax=docker/dockerfile:1
 
 # ---------------------------------------------------------------------------
-# Stage 1 — builder: resolve + install dependencies into /app/.venv with uv.
-# The uv binary, build caches, and toolchain stay in this stage and never
-# reach the final image.
+# Stage 1 — builder: pip-install dependencies into an isolated venv.
+# The venv is copied wholesale to the runtime stage; pip and the build cache
+# stay here and never reach the final image.
 # ---------------------------------------------------------------------------
-FROM ghcr.io/astral-sh/uv:python3.14-trixie-slim AS builder
+FROM python:3.14-slim-trixie AS builder
 
 WORKDIR /app
 
-# uv build settings:
-#   - compile bytecode for faster cold starts
-#   - copy (not hardlink) so the venv is self-contained and copyable to stage 2
-#   - skip dev dependencies
-#   - use the image's Python (don't download a standalone interpreter), so the
-#     venv references /usr/local/bin/python — which also exists in the runtime
-#     image, keeping the copied venv valid.
-ENV UV_COMPILE_BYTECODE=1 \
-    UV_LINK_MODE=copy \
-    UV_NO_DEV=1 \
-    UV_PYTHON_DOWNLOADS=0
+# Self-contained virtualenv we can copy to stage 2. It references
+# /usr/local/bin/python, which also exists in the (identical) runtime base.
+RUN python -m venv /app/.venv
+ENV PATH="/app/.venv/bin:$PATH" \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install dependencies first, without the project, for optimal layer caching.
-# The uv cache is a BuildKit cache mount, so it never lands in any image layer.
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --locked --no-install-project --no-dev
+# Install dependencies first, in their own layer, for caching. requirements.txt
+# carries the --extra-index-url for the CPU-only torch wheels. The pip cache is
+# a BuildKit cache mount, so it never lands in an image layer.
+COPY requirements.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
 
-# Then add the source and install the project itself.
+# Then add the application source.
 COPY . /app
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev
 
 # ---------------------------------------------------------------------------
-# Stage 2 — runtime: a clean Python image with only the venv + app source.
-# No uv, no build caches, no compiler toolchain.
+# Stage 2 — runtime: clean Python image with only the venv + app source.
+# No pip cache, no build tooling.
 # ---------------------------------------------------------------------------
 FROM python:3.14-slim-trixie AS runtime
 
@@ -45,7 +37,7 @@ RUN groupadd --system --gid 999 nonroot \
 
 WORKDIR /app
 
-# Copy the fully-built application (source + /app/.venv) from the builder.
+# Copy the ready-made venv and the application code from the builder.
 COPY --from=builder --chown=nonroot:nonroot /app /app
 
 # Put the venv on PATH; sensible Python runtime defaults.

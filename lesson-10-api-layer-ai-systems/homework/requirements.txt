@@ -1,0 +1,32 @@
+# Direct (top-level) dependencies only — pip resolves the transitive tree.
+# Mirrors [project.dependencies] in pyproject.toml.
+
+# CPU-only PyTorch wheels. torch==X+cpu (Linux) lives here, not on PyPI; pip
+# prefers it over the CUDA build because the local "+cpu" version sorts higher.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Web framework + ASGI server (uvicorn, etc. come via the [standard] extra)
+fastapi[standard]>=0.115.0
+
+# Postgres / pgvector retrieval store
+psycopg[binary]>=3.2.0
+pgvector>=0.3.6
+
+# Embeddings + chunking (pulls in torch, transformers, numpy, scipy, ...)
+sentence-transformers>=3.0.0
+langchain-text-splitters>=0.3.0
+
+# OpenRouter (OpenAI-compatible) client
+openai>=1.50.0
+
+# Rate-limit token bucket + metrics
+redis>=5.0.0
+
+# Semantic response cache
+qdrant-client>=1.10.0
+
+# Observability (optional at runtime; no-op without LANGFUSE_* env vars)
+langfuse>=3.0.0
+
+# CPU build forced via the --extra-index-url above
+torch>=2.2.0
