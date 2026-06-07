@@ -14,7 +14,7 @@ env/
 .gitignore
 
 # Documentation
-README.md
+HOMEWORK.md
 
 # Docker
 Dockerfile
